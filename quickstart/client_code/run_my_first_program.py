@@ -1,6 +1,5 @@
 """
-PROGRAM 3
-Ranked Choice Voting System
+Program 3: So basically a voting system rank based
 nr of voters: m = 4
 nr of candidates: n = 3
 """
