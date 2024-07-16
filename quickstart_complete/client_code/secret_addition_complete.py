@@ -1,142 +1,74 @@
 """
-In this example, we:
-1. connect to the local nillion-devnet
-2. store the secret addition program
-3. store a secret to be used in the computation
-4. compute the secret addition program with the stored secret and another computation time secret
+PROGRAM 3
+Ranked Choice Voting System
+nr of voters: m = 4
+nr of candidates: n = 3
 """
+from nada_dsl import *
 
-import asyncio
-import py_nillion_client as nillion
-import os
+def nada_main():
+    # 1. Parties initialization
+    voter0 = Party(name="Voter0")
+    voter1 = Party(name="Voter1")
+    voter2 = Party(name="Voter2")
+    voter3 = Party(name="Voter3")
+    outparty = Party(name="OutParty")
 
-from py_nillion_client import NodeKey, UserKey
-from dotenv import load_dotenv
-from nillion_python_helpers import get_quote_and_pay, create_nillion_client, create_payments_config
+    # 2. Inputs initialization
+    # Each voter ranks the candidates (0, 1, 2)
+    # Lower number means higher preference
+    votes = [
+        [SecretUnsignedInteger(Input(name=f"v{i}_c{j}", party=globals()[f"voter{i}"])) 
+         for j in range(3)] 
+        for i in range(4)
+    ]
 
-from cosmpy.aerial.client import LedgerClient
-from cosmpy.aerial.wallet import LocalWallet
-from cosmpy.crypto.keypairs import PrivateKey
+    # 3. Computation
+    # Initialize vote counts for each candidate
+    vote_counts = [SecretUnsignedInteger(0) for _ in range(3)]
 
-home = os.getenv("HOME")
-load_dotenv(f"{home}/.config/nillion/nillion-devnet.env")
+    # First round: Count first preferences
+    for voter_votes in votes:
+        for i, rank in enumerate(voter_votes):
+            vote_counts[i] += (rank == 0).if_else(1, 0)
 
-async def main():
-    # 1. Initial setup
-    # 1.1. Get cluster_id, grpc_endpoint, & chain_id from the .env file
-    cluster_id = os.getenv("NILLION_CLUSTER_ID")
-    grpc_endpoint = os.getenv("NILLION_NILCHAIN_GRPC")
-    chain_id = os.getenv("NILLION_NILCHAIN_CHAIN_ID")
-    # 1.2 pick a seed and generate user and node keys
-    seed = "my_seed"
-    userkey = UserKey.from_seed(seed)
-    nodekey = NodeKey.from_seed(seed)
+    # Check if any candidate has majority
+    total_votes = SecretUnsignedInteger(len(votes))
+    majority = total_votes // 2 + 1
+    
+    has_majority = SecretUnsignedInteger(0)
+    winner = SecretUnsignedInteger(0)
 
-    # 2. Initialize NillionClient against nillion-devnet
-    # Create Nillion Client for user
-    client = create_nillion_client(userkey, nodekey)
+    for i, count in enumerate(vote_counts):
+        is_majority = count >= majority
+        has_majority += is_majority
+        winner += is_majority * i
 
-    party_id = client.party_id
-    user_id = client.user_id
+    # If no majority, eliminate last place and redistribute votes
+    if has_majority == 0:
+        last_place = SecretUnsignedInteger(0)
+        for i in range(1, 3):
+            last_place += (vote_counts[i] < vote_counts[last_place]).if_else(i, last_place)
 
-    # 3. Pay for and store the program
-    # Set the program name and path to the compiled program
-    program_name = "secret_addition_complete"
-    program_mir_path = f"../nada_quickstart_programs/target/{program_name}.nada.bin"
+        # Redistribute votes
+        for voter_votes in votes:
+            for i, rank in enumerate(voter_votes):
+                is_not_last = i != last_place
+                is_second_choice = voter_votes[last_place] + 1 == rank
+                vote_counts[i] += is_not_last * is_second_choice
 
-    # Create payments config, client and wallet
-    payments_config = create_payments_config(chain_id, grpc_endpoint)
-    payments_client = LedgerClient(payments_config)
-    payments_wallet = LocalWallet(
-        PrivateKey(bytes.fromhex(os.getenv("NILLION_NILCHAIN_PRIVATE_KEY_0"))),
-        prefix="nillion",
-    )
+        # Determine winner after redistribution
+        for i, count in enumerate(vote_counts):
+            is_most_votes = SecretUnsignedInteger(1)
+            for j in range(3):
+                if i != j:
+                    is_most_votes *= count > vote_counts[j]
+            winner += is_most_votes * i
 
-    # Pay to store the program and obtain a receipt of the payment
-    receipt_store_program = await get_quote_and_pay(
-        client,
-        nillion.Operation.store_program(program_mir_path),
-        payments_wallet,
-        payments_client,
-        cluster_id,
-    )
+    # 4. Output
+    final_winner = Output(winner, "final_winner", outparty)
+    vote_count_0 = Output(vote_counts[0], "vote_count_c0", outparty)
+    vote_count_1 = Output(vote_counts[1], "vote_count_c1", outparty)
+    vote_count_2 = Output(vote_counts[2], "vote_count_c2", outparty)
 
-    # Store the program
-    action_id = await client.store_program(
-        cluster_id, program_name, program_mir_path, receipt_store_program
-    )
-
-    # Create a variable for the program_id, which is the {user_id}/{program_name}. We will need this later
-    program_id = f"{user_id}/{program_name}"
-    print("Stored program. action_id:", action_id)
-    print("Stored program_id:", program_id)
-
-    # 4. Create the 1st secret, add permissions, pay for and store it in the network
-    # Create a secret named "my_int1" with any value, ex: 500
-    new_secret = nillion.NadaValues(
-        {
-            "my_int1": nillion.SecretInteger(500),
-        }
-    )
-
-    # Set the input party for the secret
-    # The party name needs to match the party name that is storing "my_int1" in the program
-    party_name = "Party1"
-
-    # Set permissions for the client to compute on the program
-    permissions = nillion.Permissions.default_for_user(client.user_id)
-    permissions.add_compute_permissions({client.user_id: {program_id}})
-
-    # Pay for and store the secret in the network and print the returned store_id
-    receipt_store = await get_quote_and_pay(
-        client,
-        nillion.Operation.store_values(new_secret, ttl_days=5),
-        payments_wallet,
-        payments_client,
-        cluster_id,
-    )
-    # Store a secret
-    store_id = await client.store_values(
-        cluster_id, new_secret, permissions, receipt_store
-    )
-    print(f"Computing using program {program_id}")
-    print(f"Use secret store_id: {store_id}")
-
-    # 5. Create compute bindings to set input and output parties, add a computation time secret and pay for & run the computation
-    compute_bindings = nillion.ProgramBindings(program_id)
-    compute_bindings.add_input_party(party_name, party_id)
-    compute_bindings.add_output_party(party_name, party_id)
-
-    # Add my_int2, the 2nd secret at computation time
-    computation_time_secrets = nillion.NadaValues({"my_int2": nillion.SecretInteger(10)})
-
-    # Pay for the compute
-    receipt_compute = await get_quote_and_pay(
-        client,
-        nillion.Operation.compute(program_id, computation_time_secrets),
-        payments_wallet,
-        payments_client,
-        cluster_id,
-    )
-
-    # Compute on the secret
-    compute_id = await client.compute(
-        cluster_id,
-        compute_bindings,
-        [store_id],
-        computation_time_secrets,
-        receipt_compute,
-    )
-
-    # 8. Return the computation result
-    print(f"The computation was sent to the network. compute_id: {compute_id}")
-    while True:
-        compute_event = await client.next_compute_event()
-        if isinstance(compute_event, nillion.ComputeFinishedEvent):
-            print(f"✅  Compute complete for compute_id {compute_event.uuid}")
-            print(f"🖥️  The result is {compute_event.result.value}")
-            return compute_event.result.value
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return [final_winner, vote_count_0, vote_count_1, vote_count_2]
